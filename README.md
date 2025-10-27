@@ -1,15 +1,17 @@
-# Cloudflare Dynamic DNS IP Updater
+This is a fork of [https://github.com/K0p1-Git/cloudflare-ddns-updater]
+
+# ~~Cloudflare Dynamic~~ Netlify DNS IP Updater
 <img alt="GitHub" src="https://img.shields.io/github/license/K0p1-Git/cloudflare-ddns-updater?color=black"> <img alt="GitHub last commit (branch)" src="https://img.shields.io/github/last-commit/K0p1-Git/cloudflare-ddns-updater/main"> <img alt="GitHub contributors" src="https://img.shields.io/github/contributors/K0p1-Git/cloudflare-ddns-updater">
 
 This script is used to update Dynamic DNS (DDNS) service based on Cloudflare! Access your home network remotely via a custom domain name without a static IP! Written in pure BASH.
 
-## Support Me
+## Support k0p1-Git
 [![Donate Via Paypal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.me/Jasonkkf)
 
 ## Installation
 
 ```bash
-git clone https://github.com/K0p1-Git/cloudflare-ddns-updater.git
+git clone https://github.com/WilliamSchweitzer/netlify-ddns-updater.git
 ```
 
 ## Usage
@@ -28,8 +30,6 @@ This script is used with crontab. Specify the frequency of execution through cro
 ```
 
 ## Tested Environments:
-macOS Mojave version 10.14.6 (x86_64) <br />
-AlmaLinux 9.3 (Linux kernel: 5.14.0 | x86_64) <br />
 Debian Bullseye 11 (Linux kernel: 6.1.28 | aarch64) <br />
 
 ## Contributing
