@@ -1,13 +1,12 @@
 #!/bin/bash
 ## change to "bin/sh" when necessary
 
-auth_email=""                                       # The email used to login 'https://dash.cloudflare.com'
-auth_method="token"                                 # Set to "global" for Global API Key or "token" for Scoped API Token
-auth_key=""                                         # Your API Token or Global API Key
-zone_identifier=""                                  # Can be found in the "Overview" tab of your domain
-record_name=""                                      # Which record you want to be synced
+# Netlify Configuration
+auth_token=""                                       # Your Netlify Personal Access Token (get from User Settings > Applications)
+dns_zone_id=""                                      # Your DNS Zone ID (found in Domain Settings)
+record_name=""                                      # Which record you want to be synced (e.g., "subdomain" or "@" for root)
+domain_name=""                                      # Your domain name (e.g., "example.com")
 ttl=3600                                            # Set the DNS TTL (seconds)
-proxy="false"                                       # Set the proxy to true or false
 sitename=""                                         # Title of site "Example Site"
 slackchannel=""                                     # Slack Channel #example
 slackuri=""                                         # URI for Slack WebHook "https://hooks.slack.com/services/xxxxx"
@@ -43,12 +42,12 @@ if [[ -z "$CURRENT_IP" ]]; then
 fi
 
 ###########################################
-## Check and set the proper auth header
+## Construct the full hostname
 ###########################################
-if [[ "${auth_method}" == "global" ]]; then
-  auth_header="X-Auth-Key:"
+if [[ "$record_name" == "@" ]]; then
+  full_hostname="$domain_name"
 else
-  auth_header="Authorization: Bearer"
+  full_hostname="$record_name.$domain_name"
 fi
 
 ###########################################
@@ -56,77 +55,129 @@ fi
 ###########################################
 
 logger "DDNS Updater: Check Initiated"
-record=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records?type=A&name=$record_name" \
-                      -H "X-Auth-Email: $auth_email" \
-                      -H "$auth_header $auth_key" \
+records=$(curl -s -X GET "https://api.netlify.com/api/v1/dns_zones/$dns_zone_id/dns_records" \
+                      -H "Authorization: Bearer $auth_token" \
                       -H "Content-Type: application/json")
+
+###########################################
+## Find the specific A record
+###########################################
+record_id=""
+old_ip=""
+
+# Parse the JSON response to find our A record
+# Using jq if available, otherwise fallback to sed/grep
+if command -v jq &> /dev/null; then
+  # Use jq for proper JSON parsing
+  record_data=$(echo "$records" | jq -r ".[] | select(.hostname==\"$full_hostname\" and .type==\"A\")")
+  if [[ ! -z "$record_data" ]]; then
+    record_id=$(echo "$record_data" | jq -r '.id')
+    old_ip=$(echo "$record_data" | jq -r '.value')
+  fi
+else
+  # Fallback to grep/sed parsing
+  while IFS= read -r line; do
+    if [[ $line == *"\"hostname\":\"$full_hostname\""* ]] && [[ $line == *"\"type\":\"A\""* ]]; then
+      record_id=$(echo "$line" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+      old_ip=$(echo "$line" | sed -E 's/.*"value":"([^"]+)".*/\1/')
+      break
+    fi
+  done <<< "$(echo "$records" | tr '{' '\n')"
+fi
 
 ###########################################
 ## Check if the domain has an A record
 ###########################################
-if [[ $record == *"\"count\":0"* ]]; then
-  logger -s "DDNS Updater: Record does not exist, perhaps create one first? (${CURRENT_IP} for ${record_name})"
-  exit 1
+if [[ -z "$record_id" ]]; then
+  logger -s "DDNS Updater: A record for $full_hostname does not exist. Creating new record..."
+  
+  # Create new A record
+  create_result=$(curl -s -X POST "https://api.netlify.com/api/v1/dns_zones/$dns_zone_id/dns_records" \
+                        -H "Authorization: Bearer $auth_token" \
+                        -H "Content-Type: application/json" \
+                        --data "{\"type\":\"A\",\"hostname\":\"$full_hostname\",\"value\":\"$CURRENT_IP\",\"ttl\":$ttl}")
+  
+  if [[ $create_result == *"\"id\""* ]]; then
+    logger "DDNS Updater: Successfully created A record for $full_hostname with IP $CURRENT_IP"
+    
+    if [[ $slackuri != "" ]]; then
+      curl -L -X POST $slackuri \
+      --data-raw '{
+        "channel": "'$slackchannel'",
+        "text" : "'"$sitename"' DDNS Record Created: '"$full_hostname"' with IP '"$CURRENT_IP"'"
+      }'
+    fi
+    if [[ $discorduri != "" ]]; then
+      curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
+      --data-raw '{
+        "content" : "'"$sitename"' DDNS Record Created: '"$full_hostname"' with IP '"$CURRENT_IP"'"
+      }' $discorduri
+    fi
+    exit 0
+  else
+    logger -s "DDNS Updater: Failed to create A record for $full_hostname"
+    exit 1
+  fi
 fi
 
 ###########################################
-## Get existing IP
+## Compare if they're the same
 ###########################################
-old_ip=$(echo "$record" | sed -E 's/.*"content":"(([0-9]{1,3}\.){3}[0-9]{1,3})".*/\1/')
-# Compare if they're the same
 if [[ $CURRENT_IP == $old_ip ]]; then
-  logger "DDNS Updater: IP ($CURRENT_IP) for ${record_name} has not changed."
+  logger "DDNS Updater: IP ($CURRENT_IP) for ${full_hostname} has not changed."
   exit 0
 fi
 
 ###########################################
-## Set the record identifier from result
+## Update the IP using Netlify API
 ###########################################
-record_identifier=$(echo "$record" | sed -E 's/.*"id":"([A-Za-z0-9_]+)".*/\1/')
+# Note: Netlify requires DELETE and CREATE for updates (no PATCH support for DNS records)
 
-###########################################
-## Change the IP@Cloudflare using the API
-###########################################
-update=$(curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$record_identifier" \
-                     -H "X-Auth-Email: $auth_email" \
-                     -H "$auth_header $auth_key" \
+# First, delete the old record
+delete_result=$(curl -s -X DELETE "https://api.netlify.com/api/v1/dns_zones/$dns_zone_id/dns_records/$record_id" \
+                     -H "Authorization: Bearer $auth_token")
+
+# Then create a new record with the updated IP
+update_result=$(curl -s -X POST "https://api.netlify.com/api/v1/dns_zones/$dns_zone_id/dns_records" \
+                     -H "Authorization: Bearer $auth_token" \
                      -H "Content-Type: application/json" \
-                     --data "{\"type\":\"A\",\"name\":\"$record_name\",\"content\":\"$CURRENT_IP\",\"ttl\":$ttl,\"proxied\":${proxy}}")
+                     --data "{\"type\":\"A\",\"hostname\":\"$full_hostname\",\"value\":\"$CURRENT_IP\",\"ttl\":$ttl}")
 
 ###########################################
 ## Report the status
 ###########################################
-case "$update" in
-*"\"success\":false"*)
-  echo -e "DDNS Updater: $CURRENT_IP $record_name DDNS failed for $record_identifier ($CURRENT_IP). DUMPING RESULTS:\n$update" | logger -s 
+if [[ $update_result == *"\"id\""* ]]; then
+  logger "DDNS Updater: Successfully updated $full_hostname from $old_ip to $CURRENT_IP"
+  
   if [[ $slackuri != "" ]]; then
     curl -L -X POST $slackuri \
     --data-raw '{
       "channel": "'$slackchannel'",
-      "text" : "'"$sitename"' DDNS Update Failed: '$record_name': '$record_identifier' ('$CURRENT_IP')."
+      "text" : "'"$sitename"' Updated: '"$full_hostname"' IP changed from '"$old_ip"' to '"$CURRENT_IP"'"
     }'
   fi
   if [[ $discorduri != "" ]]; then
     curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
     --data-raw '{
-      "content" : "'"$sitename"' DDNS Update Failed: '$record_name': '$record_identifier' ('$CURRENT_IP')."
+      "content" : "'"$sitename"' Updated: '"$full_hostname"' IP changed from '"$old_ip"' to '"$CURRENT_IP"'"
     }' $discorduri
   fi
-  exit 1;;
-*)
-  logger "DDNS Updater: $CURRENT_IP $record_name DDNS updated."
+  exit 0
+else
+  echo -e "DDNS Updater: Failed to update $full_hostname to $CURRENT_IP. Response:\n$update_result" | logger -s
+  
   if [[ $slackuri != "" ]]; then
     curl -L -X POST $slackuri \
     --data-raw '{
       "channel": "'$slackchannel'",
-      "text" : "'"$sitename"' Updated: '$record_name''"'"'s'""' new IP Address is '$CURRENT_IP'"
+      "text" : "'"$sitename"' DDNS Update Failed: '"$full_hostname"' could not be updated to '"$CURRENT_IP"'"
     }'
   fi
   if [[ $discorduri != "" ]]; then
     curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
     --data-raw '{
-      "content" : "'"$sitename"' Updated: '$record_name''"'"'s'""' new IP Address is '$CURRENT_IP'"
+      "content" : "'"$sitename"' DDNS Update Failed: '"$full_hostname"' could not be updated to '"$CURRENT_IP"'"
     }' $discorduri
   fi
-  exit 0;;
-esac
+  exit 1
+fi
